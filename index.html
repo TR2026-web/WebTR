@@ -351,7 +351,7 @@ function allRooms() {
 async function gasGet(params) {
   if (!GAS_URL) throw new Error('No GAS URL');
   const url = GAS_URL + '?' + new URLSearchParams(params);
-  const res = await fetch(url);
+  const res = await fetch(url, { redirect: 'follow' });
   const data = await res.json();
   if (data.error) throw new Error(data.error);
   return data;
@@ -359,10 +359,12 @@ async function gasGet(params) {
 
 async function gasPost(body) {
   if (!GAS_URL) throw new Error('No GAS URL');
+  const form = new FormData();
+  form.append('payload', JSON.stringify(body));
   const res = await fetch(GAS_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    body: form,
+    redirect: 'follow'
   });
   const data = await res.json();
   if (data.error) throw new Error(data.error);
