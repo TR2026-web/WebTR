@@ -18,8 +18,7 @@
 
   /* SETUP SCREEN */
   #setup-screen {
-    position: fixed; inset: 0; background: var(--sidebar);
-    display: flex; align-items: center; justify-content: center; z-index: 9999;
+    display: none !important;
   }
   .setup-box { background: var(--card); border-radius: 16px; padding: 40px; max-width: 480px; width: 100%; }
   .setup-title { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
@@ -187,6 +186,7 @@
       <div class="nav-item" onclick="showPage('summary')" id="nav-summary"><span class="icon">📊</span><span>สรุปผลทั้งหมด</span></div>
       <div class="nav-item" onclick="syncFromServer()"><span class="icon">🔄</span><span>ดึงข้อมูลจาก Sheets</span></div>
       <div class="nav-item" onclick="exportCSV()"><span class="icon">📥</span><span>Export CSV</span></div>
+      <div class="nav-item" onclick="openSettings()"><span class="icon">⚙️</span><span>ตั้งค่า GAS URL</span></div>
     </nav>
     <div style="padding:12px 16px;border-top:1px solid rgba(255,255,255,0.08);">
       <div style="font-size:11px;color:rgba(255,255,255,0.3);" id="last-sync-label">ยังไม่ได้ sync</div>
@@ -339,6 +339,28 @@
 </div>
 
 <button class="sync-btn" onclick="syncFromServer()" title="ดึงข้อมูลจาก Google Sheets">🔄 Sync</button>
+
+<!-- MODAL: Settings -->
+<div class="modal-overlay" id="settings-modal">
+  <div class="modal" style="max-width:460px">
+    <div class="modal-header">
+      <div class="modal-title">⚙️ ตั้งค่า GAS URL</div>
+      <button class="btn btn-outline btn-sm" onclick="document.getElementById('settings-modal').classList.remove('open')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="alert alert-info" style="font-size:12px">เปลี่ยน URL ของ Google Apps Script Web App ที่ใช้เชื่อมต่อ</div>
+      <div class="form-group">
+        <label>Google Apps Script Web App URL</label>
+        <input type="text" id="settings-gas-url" placeholder="https://script.google.com/macros/s/...../exec" style="font-size:12px">
+      </div>
+      <div id="settings-status" style="font-size:12px;color:var(--text-muted);margin-top:8px"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="clearGasUrl()">🗑️ ล้าง URL (Local mode)</button>
+      <button class="btn btn-primary" onclick="saveGasUrl()">💾 บันทึกและเชื่อมต่อ</button>
+    </div>
+  </div>
+</div>
 
 <script>
 // ============================================================
@@ -525,12 +547,33 @@ function startApp() {
   updateTopbar();
 }
 
-if (GAS_URL) {
-  document.getElementById('gas-url-input').value = GAS_URL;
-  startApp();
-} else if (localStorage.getItem('scs_gs')) {
-  document.getElementById('setup-screen').style.display = 'flex';
-}
+// เริ่มต้นอัตโนมัติ — ข้ามหน้า Setup เสมอ
+// ถ้ามี GAS_URL เก็บไว้ → เชื่อมต่อ Sheets อัตโนมัติ ถ้าไม่มี → Local mode
+(async function autoStart() {
+  if (GAS_URL) {
+    document.getElementById('gas-url-input').value = GAS_URL;
+    USE_SHEETS = true;
+    // โหลดข้อมูลจาก Sheets แบบ background (ไม่บล็อก UI)
+    startApp();
+    try {
+      const data = await gasGetJsonp({ action: 'getAllData' });
+      state.students   = data.students   || {};
+      state.members    = data.members    || {};
+      state.voteClass  = data.voteClass  || {};
+      state.voteSchool = data.voteSchool || {levelWinners:{},votes:{},voted:[],winner:null};
+      saveLocalState();
+      document.getElementById('last-sync-label').textContent = 'Auto-sync: ' + new Date().toLocaleTimeString('th');
+      renderRooms();
+    } catch(e) {
+      // ใช้ข้อมูล local ที่มีอยู่ต่อไป ไม่แสดง error
+      console.warn('Auto-sync failed, using local data:', e.message);
+    }
+  } else {
+    // ไม่มี GAS URL → Local mode ทันที
+    USE_SHEETS = false;
+    startApp();
+  }
+})();
 
 // ============================================================
 // SYNC
@@ -1149,6 +1192,56 @@ function exportCSV(){
   a.href=URL.createObjectURL(blob);
   a.download=`members_${new Date().toISOString().slice(0,10)}.csv`;
   a.click();
+}
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+function openSettings() {
+  document.getElementById('settings-gas-url').value = GAS_URL || '';
+  document.getElementById('settings-status').textContent = GAS_URL ? '✅ กำลังใช้ Google Sheets mode' : '💾 กำลังใช้ Local mode';
+  document.getElementById('settings-modal').classList.add('open');
+}
+
+async function saveGasUrl() {
+  const url = document.getElementById('settings-gas-url').value.trim();
+  if (!url) { alert('กรุณากรอก URL'); return; }
+  const status = document.getElementById('settings-status');
+  status.textContent = '🔄 กำลังทดสอบ...';
+  const prevUrl = GAS_URL;
+  GAS_URL = url;
+  try {
+    const data = await gasGetJsonp({ action: 'getAllData' });
+    USE_SHEETS = true;
+    localStorage.setItem('gas_url', url);
+    state.students   = data.students   || {};
+    state.members    = data.members    || {};
+    state.voteClass  = data.voteClass  || {};
+    state.voteSchool = data.voteSchool || {levelWinners:{},votes:{},voted:[],winner:null};
+    saveLocalState();
+    document.getElementById('sidebar-mode').textContent = 'Google Sheets';
+    document.getElementById('last-sync-label').textContent = 'Sync: ' + new Date().toLocaleTimeString('th');
+    status.textContent = '✅ เชื่อมต่อสำเร็จ!';
+    setTimeout(() => {
+      document.getElementById('settings-modal').classList.remove('open');
+      renderRooms();
+    }, 800);
+  } catch(e) {
+    GAS_URL = prevUrl;
+    status.textContent = '❌ เชื่อมต่อไม่ได้: ' + e.message;
+  }
+}
+
+function clearGasUrl() {
+  if (!confirm('ล้าง GAS URL และเปลี่ยนเป็น Local mode?')) return;
+  GAS_URL = '';
+  USE_SHEETS = false;
+  localStorage.removeItem('gas_url');
+  document.getElementById('sidebar-mode').textContent = 'Local Mode';
+  document.getElementById('photo-mode-label').textContent = '(บันทึก local — ไม่ sync)';
+  document.getElementById('settings-modal').classList.remove('open');
+  showToast('เปลี่ยนเป็น Local mode แล้ว');
 }
 </script>
 </body>
