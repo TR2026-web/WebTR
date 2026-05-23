@@ -411,21 +411,41 @@ async function gasPost(body) {
 }
 
 /**
- * อัปโหลดรูปผ่าน POST จริง (เพราะ Base64 ใหญ่เกิน URL limit)
- * @param {string} memberId
- * @param {string} base64   - ไม่มี data:... prefix
- * @param {string} mime     - e.g. "image/jpeg"
+ * อัปโหลดรูปไปยัง Google Drive ผ่าน JSONP (chunk-based)
+ * GAS ไม่รองรับ CORS POST จาก GitHub Pages → ใช้ JSONP GET แทน
+ * รูปจะถูกย่อเป็น max 350px ก่อน → Base64 ~15-25KB → ส่งผ่าน URL ได้
+ *
+ * ขั้นตอน:
+ *  1. ส่ง chunk ทีละ 6000 chars (action=photoChunk)
+ *  2. เมื่อส่งครบ → ส่ง action=photoFinish → GAS บันทึกลง Drive → คืน URL
  */
 async function uploadPhotoToDrive(memberId, base64, mime) {
   if (!GAS_URL) throw new Error('No GAS URL');
-  const resp = await fetch(GAS_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'uploadPhoto', memberId, imageBase64: base64, mimeType: mime })
+  const CHUNK = 6000;
+  const total = Math.ceil(base64.length / CHUNK);
+
+  // ส่งทีละ chunk
+  for (let i = 0; i < total; i++) {
+    const chunk = base64.slice(i * CHUNK, (i + 1) * CHUNK);
+    await gasGetJsonp({
+      action:   'photoChunk',
+      memberId: memberId,
+      index:    i,
+      total:    total,
+      mime:     mime,
+      data:     chunk
+    });
+    if (window._chunkProgress) window._chunkProgress(i + 1, total);
+  }
+
+  // สั่ง finalize → GAS รวม chunk + อัปโหลด Drive → คืน URL
+  const result = await gasGetJsonp({
+    action:   'photoFinish',
+    memberId: memberId,
+    mime:     mime
   });
-  const data = await resp.json();
-  if (data.error) throw new Error(data.error);
-  return data; // { success, url, fileId }
+  if (result.error) throw new Error(result.error);
+  return result; // { success, url, fileId }
 }
 
 // ============================================================
@@ -682,8 +702,8 @@ function updatePhotoPreview() {
 function handlePhotoSelect(e) {
   const file = e.target.files[0];
   if (!file) return;
-  // ย่อรูปก่อน อัปโหลด (max 800px, quality 0.75)
-  resizeImage(file, 800, 0.75, (base64, mime, blobUrl) => {
+  // ย่อ max 350px เพื่อให้ Base64 พอดีกับ JSONP chunk
+  resizeImage(file, 350, 0.82, (base64, mime, blobUrl) => {
     photoBase64   = base64;
     photoMime     = mime;
     photoUrl      = blobUrl;   // blob URL สำหรับ preview ก่อน
@@ -786,7 +806,15 @@ async function saveMember() {
     if (photoBase64 && !photoUploaded) {
       const memberId = editId || ('new_' + Date.now());
       if (USE_SHEETS && GAS_URL) {
-        btn.textContent = '📤 กำลังอัปโหลดรูป...';
+        const totalChunks = Math.ceil(photoBase64.length / 6000);
+        btn.textContent = `📤 อัปโหลดรูป (0/${totalChunks})...`;
+        // Override gasGetJsonp เพื่อ update progress
+        const origUpload = uploadPhotoToDrive;
+        let chunkDone = 0;
+        const _origJsonp = gasGetJsonp;
+        window._chunkProgress = (done, total) => {
+          btn.textContent = `📤 อัปโหลดรูป (${done}/${total})...`;
+        };
         const result = await uploadPhotoToDrive(memberId, photoBase64, photoMime);
         finalPhotoUrl = result.url;
         photoUrl      = finalPhotoUrl;
