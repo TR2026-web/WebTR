@@ -619,8 +619,10 @@ async function saveMember() {
   btn.textContent='⏳ บันทึก...';btn.disabled=true;
   try {
     if(USE_SHEETS) {
-      if(editId) await gasPost({action:'updateMember',room:currentRoom,member});
-      else await gasPost({action:'addMember',room:currentRoom,member});
+      // ไม่ส่งรูปขึ้น GAS เพราะ Base64 ใหญ่เกิน URL limit
+      const memberNoPhoto={...member, photo:''};
+      if(editId) await gasPost({action:'updateMember',room:currentRoom,member:memberNoPhoto});
+      else await gasPost({action:'addMember',room:currentRoom,member:memberNoPhoto});
     }
     if(!state.members[currentRoom])state.members[currentRoom]=[];
     if(editId){const i=state.members[currentRoom].findIndex(x=>x.id===editId);if(i>=0)state.members[currentRoom][i]=member;}
