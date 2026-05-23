@@ -348,27 +348,31 @@ function allRooms() {
 // API LAYER
 // ============================================================
 
+function gasGetJsonp(params) {
+  return new Promise((resolve, reject) => {
+    const cb = 'cb_' + Date.now();
+    params.callback = cb;
+    const url = GAS_URL + '?' + new URLSearchParams(params);
+    const script = document.createElement('script');
+    const timer = setTimeout(() => { reject(new Error('Timeout')); script.remove(); delete window[cb]; }, 15000);
+    window[cb] = (data) => { clearTimeout(timer); script.remove(); delete window[cb]; if(data.error) reject(new Error(data.error)); else resolve(data); };
+    script.src = url;
+    script.onerror = () => { clearTimeout(timer); reject(new Error('Script load error')); delete window[cb]; };
+    document.head.appendChild(script);
+  });
+}
+
 async function gasGet(params) {
   if (!GAS_URL) throw new Error('No GAS URL');
-  const url = GAS_URL + '?' + new URLSearchParams(params);
-  const res = await fetch(url, { redirect: 'follow' });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  return data;
+  return gasGetJsonp(params);
 }
 
 async function gasPost(body) {
   if (!GAS_URL) throw new Error('No GAS URL');
-  const form = new FormData();
-  form.append('payload', JSON.stringify(body));
-  const res = await fetch(GAS_URL, {
-    method: 'POST',
-    body: form,
-    redirect: 'follow'
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  return data;
+  // POST via GET with action encoded (GAS workaround)
+  const params = { ...body };
+  if (body.member) params.member = JSON.stringify(body.member);
+  return gasGetJsonp(params);
 }
 
 // ============================================================
