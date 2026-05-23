@@ -385,14 +385,20 @@ function allRooms() {
 
 function gasGetJsonp(params) {
   return new Promise((resolve, reject) => {
-    const cb = 'cb_' + Date.now();
+    const cb = 'cb_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
     params.callback = cb;
     const url = GAS_URL + '?' + new URLSearchParams(params);
+    // GAS Web App มี redirect และ cold-start อาจใช้เวลา → timeout 35 วินาที
+    const timer = setTimeout(() => { reject(new Error('Timeout (35s) — ลอง Deploy ใหม่หรือตรวจสอบ URL')); script.remove(); delete window[cb]; }, 35000);
     const script = document.createElement('script');
-    const timer = setTimeout(() => { reject(new Error('Timeout')); script.remove(); delete window[cb]; }, 20000);
     window[cb] = (data) => { clearTimeout(timer); script.remove(); delete window[cb]; if(data.error) reject(new Error(data.error)); else resolve(data); };
     script.src = url;
-    script.onerror = () => { clearTimeout(timer); reject(new Error('Script load error')); delete window[cb]; };
+    script.onerror = (err) => {
+      clearTimeout(timer); delete window[cb]; script.remove();
+      // GAS มักคืน HTTP 302 redirect → script tag ติดตาม redirect ได้ แต่ถ้า onerror หมายความว่า
+      // URL ผิด หรือ GAS ไม่ได้ Deploy เป็น "Anyone" access หรือ URL หมดอายุ
+      reject(new Error('ไม่สามารถโหลด script ได้ — ตรวจสอบว่า Deploy ตั้ง Access: Anyone และ URL ถูกต้อง'));
+    };
     document.head.appendChild(script);
   });
 }
@@ -421,20 +427,31 @@ async function gasPost(body) {
  */
 async function uploadPhotoToDrive(memberId, base64, mime) {
   if (!GAS_URL) throw new Error('No GAS URL');
-  const CHUNK = 6000;
+  const CHUNK = 2000;
   const total = Math.ceil(base64.length / CHUNK);
 
-  // ส่งทีละ chunk
+  // ส่งทีละ chunk พร้อม retry สูงสุด 3 ครั้ง
   for (let i = 0; i < total; i++) {
     const chunk = base64.slice(i * CHUNK, (i + 1) * CHUNK);
-    await gasGetJsonp({
-      action:   'photoChunk',
-      memberId: memberId,
-      index:    i,
-      total:    total,
-      mime:     mime,
-      data:     chunk
-    });
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await gasGetJsonp({
+          action:   'photoChunk',
+          memberId: memberId,
+          index:    i,
+          total:    total,
+          mime:     mime,
+          data:     chunk
+        });
+        lastErr = null;
+        break;
+      } catch(e) {
+        lastErr = e;
+        await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
+      }
+    }
+    if (lastErr) throw new Error('Chunk ' + (i+1) + '/' + total + ' ส่งไม่สำเร็จ: ' + lastErr.message);
     if (window._chunkProgress) window._chunkProgress(i + 1, total);
   }
 
@@ -457,10 +474,10 @@ async function connectGAS() {
   if (!url) { alert('กรุณากรอก URL'); return; }
   const status = document.getElementById('connect-status');
   status.textContent = '🔄 กำลังทดสอบการเชื่อมต่อ...';
+  // ต้องใช้ JSONP เพราะ GAS Web App มี redirect ทำให้ fetch() ติด CORS
+  GAS_URL = url;
   try {
-    const result = await fetch(url + '?action=getAllData');
-    const data = await result.json();
-    GAS_URL = url;
+    const data = await gasGetJsonp({ action: 'getAllData' });
     USE_SHEETS = true;
     localStorage.setItem('gas_url', url);
     state.students   = data.students   || {};
@@ -472,6 +489,7 @@ async function connectGAS() {
     document.getElementById('sidebar-mode').textContent = 'Google Sheets';
     setTimeout(startApp, 800);
   } catch(e) {
+    GAS_URL = localStorage.getItem('gas_url') || '';
     status.textContent = '❌ เชื่อมต่อไม่ได้: ' + e.message;
   }
 }
@@ -703,7 +721,7 @@ function handlePhotoSelect(e) {
   const file = e.target.files[0];
   if (!file) return;
   // ย่อ max 350px เพื่อให้ Base64 พอดีกับ JSONP chunk
-  resizeImage(file, 350, 0.82, (base64, mime, blobUrl) => {
+  resizeImage(file, 280, 0.75, (base64, mime, blobUrl) => {
     photoBase64   = base64;
     photoMime     = mime;
     photoUrl      = blobUrl;   // blob URL สำหรับ preview ก่อน
