@@ -18,7 +18,8 @@
 
   /* SETUP SCREEN */
   #setup-screen {
-    display: none !important;
+    position: fixed; inset: 0; background: var(--sidebar);
+    display: flex; align-items: center; justify-content: center; z-index: 9999;
   }
   .setup-box { background: var(--card); border-radius: 16px; padding: 40px; max-width: 480px; width: 100%; }
   .setup-title { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
@@ -186,7 +187,6 @@
       <div class="nav-item" onclick="showPage('summary')" id="nav-summary"><span class="icon">📊</span><span>สรุปผลทั้งหมด</span></div>
       <div class="nav-item" onclick="syncFromServer()"><span class="icon">🔄</span><span>ดึงข้อมูลจาก Sheets</span></div>
       <div class="nav-item" onclick="exportCSV()"><span class="icon">📥</span><span>Export CSV</span></div>
-      <div class="nav-item" onclick="openSettings()"><span class="icon">⚙️</span><span>ตั้งค่า GAS URL</span></div>
     </nav>
     <div style="padding:12px 16px;border-top:1px solid rgba(255,255,255,0.08);">
       <div style="font-size:11px;color:rgba(255,255,255,0.3);" id="last-sync-label">ยังไม่ได้ sync</div>
@@ -340,28 +340,6 @@
 
 <button class="sync-btn" onclick="syncFromServer()" title="ดึงข้อมูลจาก Google Sheets">🔄 Sync</button>
 
-<!-- MODAL: Settings -->
-<div class="modal-overlay" id="settings-modal">
-  <div class="modal" style="max-width:460px">
-    <div class="modal-header">
-      <div class="modal-title">⚙️ ตั้งค่า GAS URL</div>
-      <button class="btn btn-outline btn-sm" onclick="document.getElementById('settings-modal').classList.remove('open')">✕</button>
-    </div>
-    <div class="modal-body">
-      <div class="alert alert-info" style="font-size:12px">เปลี่ยน URL ของ Google Apps Script Web App ที่ใช้เชื่อมต่อ</div>
-      <div class="form-group">
-        <label>Google Apps Script Web App URL</label>
-        <input type="text" id="settings-gas-url" placeholder="https://script.google.com/macros/s/...../exec" style="font-size:12px">
-      </div>
-      <div id="settings-status" style="font-size:12px;color:var(--text-muted);margin-top:8px"></div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-outline" onclick="clearGasUrl()">🗑️ ล้าง URL (Local mode)</button>
-      <button class="btn btn-primary" onclick="saveGasUrl()">💾 บันทึกและเชื่อมต่อ</button>
-    </div>
-  </div>
-</div>
-
 <script>
 // ============================================================
 // CONFIG & STATE
@@ -407,20 +385,14 @@ function allRooms() {
 
 function gasGetJsonp(params) {
   return new Promise((resolve, reject) => {
-    const cb = 'cb_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
+    const cb = 'cb_' + Date.now();
     params.callback = cb;
     const url = GAS_URL + '?' + new URLSearchParams(params);
-    // GAS Web App มี redirect และ cold-start อาจใช้เวลา → timeout 35 วินาที
-    const timer = setTimeout(() => { reject(new Error('Timeout (35s) — ลอง Deploy ใหม่หรือตรวจสอบ URL')); script.remove(); delete window[cb]; }, 35000);
     const script = document.createElement('script');
+    const timer = setTimeout(() => { reject(new Error('Timeout')); script.remove(); delete window[cb]; }, 20000);
     window[cb] = (data) => { clearTimeout(timer); script.remove(); delete window[cb]; if(data.error) reject(new Error(data.error)); else resolve(data); };
     script.src = url;
-    script.onerror = (err) => {
-      clearTimeout(timer); delete window[cb]; script.remove();
-      // GAS มักคืน HTTP 302 redirect → script tag ติดตาม redirect ได้ แต่ถ้า onerror หมายความว่า
-      // URL ผิด หรือ GAS ไม่ได้ Deploy เป็น "Anyone" access หรือ URL หมดอายุ
-      reject(new Error('ไม่สามารถโหลด script ได้ — ตรวจสอบว่า Deploy ตั้ง Access: Anyone และ URL ถูกต้อง'));
-    };
+    script.onerror = () => { clearTimeout(timer); reject(new Error('Script load error')); delete window[cb]; };
     document.head.appendChild(script);
   });
 }
@@ -439,55 +411,30 @@ async function gasPost(body) {
 }
 
 /**
- * แปลง standard Base64 → URL-safe Base64
- * (+ → -, / → _, = ตัดออก) เพื่อให้ส่งผ่าน query string ได้โดยไม่ผิดพลาด
- * เพราะ URLSearchParams encode + เป็น %2B และ GAS decode %2B กลับเป็น space ทำให้ Base64 เสีย
- */
-function toUrlSafeB64(b64) {
-  return b64.split('+').join('-').split('/').join('_').split('=').join('');
-}
-
-/**
- * อัปโหลดรูปผ่าน JSONP chunk-based พร้อม URL-safe Base64
- * chunk 1500 chars → URL ปลอดภัยแน่นอนแม้รวมกับ GAS URL ยาว
+ * อัปโหลดรูปไปยัง Google Drive ผ่าน JSONP (chunk-based)
+ * GAS ไม่รองรับ CORS POST จาก GitHub Pages → ใช้ JSONP GET แทน
+ * รูปจะถูกย่อเป็น max 350px ก่อน → Base64 ~15-25KB → ส่งผ่าน URL ได้
+ *
+ * ขั้นตอน:
+ *  1. ส่ง chunk ทีละ 6000 chars (action=photoChunk)
+ *  2. เมื่อส่งครบ → ส่ง action=photoFinish → GAS บันทึกลง Drive → คืน URL
  */
 async function uploadPhotoToDrive(memberId, base64, mime) {
   if (!GAS_URL) throw new Error('No GAS URL');
-  const safeB64 = toUrlSafeB64(base64);
-  const CHUNK   = 1500;
-  const total   = Math.ceil(safeB64.length / CHUNK);
+  const CHUNK = 6000;
+  const total = Math.ceil(base64.length / CHUNK);
 
+  // ส่งทีละ chunk
   for (let i = 0; i < total; i++) {
-    const chunk = safeB64.slice(i * CHUNK, (i + 1) * CHUNK);
-    let lastErr;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        await gasGetJsonp({
-          action:   'photoChunk',
-          memberId: memberId,
-          index:    i,
-          total:    total,
-          mime:     mime,
-          data:     chunk,
-          safe:     '1'
-        });
-        lastErr = null;
-        break;
-      } catch(e) {
-        lastErr = e;
-        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-      }
-    }
-    if (lastErr) throw new Error('Chunk ' + (i+1) + '/' + total + ' ส่งไม่สำเร็จ: ' + lastErr.message);
-    if (window._chunkProgress) window._chunkProgress(i + 1, total);
-  }
-
-  const result = await gasGetJsonp({ action: 'photoFinish', memberId: memberId, mime: mime });
-  if (result.error) throw new Error(result.error);
-  return result;
-}
-    }
-    if (lastErr) throw new Error('Chunk ' + (i+1) + '/' + total + ' ส่งไม่สำเร็จ: ' + lastErr.message);
+    const chunk = base64.slice(i * CHUNK, (i + 1) * CHUNK);
+    await gasGetJsonp({
+      action:   'photoChunk',
+      memberId: memberId,
+      index:    i,
+      total:    total,
+      mime:     mime,
+      data:     chunk
+    });
     if (window._chunkProgress) window._chunkProgress(i + 1, total);
   }
 
@@ -510,10 +457,10 @@ async function connectGAS() {
   if (!url) { alert('กรุณากรอก URL'); return; }
   const status = document.getElementById('connect-status');
   status.textContent = '🔄 กำลังทดสอบการเชื่อมต่อ...';
-  // ต้องใช้ JSONP เพราะ GAS Web App มี redirect ทำให้ fetch() ติด CORS
-  GAS_URL = url;
   try {
-    const data = await gasGetJsonp({ action: 'getAllData' });
+    const result = await fetch(url + '?action=getAllData');
+    const data = await result.json();
+    GAS_URL = url;
     USE_SHEETS = true;
     localStorage.setItem('gas_url', url);
     state.students   = data.students   || {};
@@ -525,7 +472,6 @@ async function connectGAS() {
     document.getElementById('sidebar-mode').textContent = 'Google Sheets';
     setTimeout(startApp, 800);
   } catch(e) {
-    GAS_URL = localStorage.getItem('gas_url') || '';
     status.textContent = '❌ เชื่อมต่อไม่ได้: ' + e.message;
   }
 }
@@ -547,33 +493,12 @@ function startApp() {
   updateTopbar();
 }
 
-// เริ่มต้นอัตโนมัติ — ข้ามหน้า Setup เสมอ
-// ถ้ามี GAS_URL เก็บไว้ → เชื่อมต่อ Sheets อัตโนมัติ ถ้าไม่มี → Local mode
-(async function autoStart() {
-  if (GAS_URL) {
-    document.getElementById('gas-url-input').value = GAS_URL;
-    USE_SHEETS = true;
-    // โหลดข้อมูลจาก Sheets แบบ background (ไม่บล็อก UI)
-    startApp();
-    try {
-      const data = await gasGetJsonp({ action: 'getAllData' });
-      state.students   = data.students   || {};
-      state.members    = data.members    || {};
-      state.voteClass  = data.voteClass  || {};
-      state.voteSchool = data.voteSchool || {levelWinners:{},votes:{},voted:[],winner:null};
-      saveLocalState();
-      document.getElementById('last-sync-label').textContent = 'Auto-sync: ' + new Date().toLocaleTimeString('th');
-      renderRooms();
-    } catch(e) {
-      // ใช้ข้อมูล local ที่มีอยู่ต่อไป ไม่แสดง error
-      console.warn('Auto-sync failed, using local data:', e.message);
-    }
-  } else {
-    // ไม่มี GAS URL → Local mode ทันที
-    USE_SHEETS = false;
-    startApp();
-  }
-})();
+if (GAS_URL) {
+  document.getElementById('gas-url-input').value = GAS_URL;
+  startApp();
+} else if (localStorage.getItem('scs_gs')) {
+  document.getElementById('setup-screen').style.display = 'flex';
+}
 
 // ============================================================
 // SYNC
@@ -778,7 +703,7 @@ function handlePhotoSelect(e) {
   const file = e.target.files[0];
   if (!file) return;
   // ย่อ max 350px เพื่อให้ Base64 พอดีกับ JSONP chunk
-  resizeImage(file, 280, 0.75, (base64, mime, blobUrl) => {
+  resizeImage(file, 350, 0.82, (base64, mime, blobUrl) => {
     photoBase64   = base64;
     photoMime     = mime;
     photoUrl      = blobUrl;   // blob URL สำหรับ preview ก่อน
@@ -1192,56 +1117,6 @@ function exportCSV(){
   a.href=URL.createObjectURL(blob);
   a.download=`members_${new Date().toISOString().slice(0,10)}.csv`;
   a.click();
-}
-
-// ============================================================
-// SETTINGS
-// ============================================================
-
-function openSettings() {
-  document.getElementById('settings-gas-url').value = GAS_URL || '';
-  document.getElementById('settings-status').textContent = GAS_URL ? '✅ กำลังใช้ Google Sheets mode' : '💾 กำลังใช้ Local mode';
-  document.getElementById('settings-modal').classList.add('open');
-}
-
-async function saveGasUrl() {
-  const url = document.getElementById('settings-gas-url').value.trim();
-  if (!url) { alert('กรุณากรอก URL'); return; }
-  const status = document.getElementById('settings-status');
-  status.textContent = '🔄 กำลังทดสอบ...';
-  const prevUrl = GAS_URL;
-  GAS_URL = url;
-  try {
-    const data = await gasGetJsonp({ action: 'getAllData' });
-    USE_SHEETS = true;
-    localStorage.setItem('gas_url', url);
-    state.students   = data.students   || {};
-    state.members    = data.members    || {};
-    state.voteClass  = data.voteClass  || {};
-    state.voteSchool = data.voteSchool || {levelWinners:{},votes:{},voted:[],winner:null};
-    saveLocalState();
-    document.getElementById('sidebar-mode').textContent = 'Google Sheets';
-    document.getElementById('last-sync-label').textContent = 'Sync: ' + new Date().toLocaleTimeString('th');
-    status.textContent = '✅ เชื่อมต่อสำเร็จ!';
-    setTimeout(() => {
-      document.getElementById('settings-modal').classList.remove('open');
-      renderRooms();
-    }, 800);
-  } catch(e) {
-    GAS_URL = prevUrl;
-    status.textContent = '❌ เชื่อมต่อไม่ได้: ' + e.message;
-  }
-}
-
-function clearGasUrl() {
-  if (!confirm('ล้าง GAS URL และเปลี่ยนเป็น Local mode?')) return;
-  GAS_URL = '';
-  USE_SHEETS = false;
-  localStorage.removeItem('gas_url');
-  document.getElementById('sidebar-mode').textContent = 'Local Mode';
-  document.getElementById('photo-mode-label').textContent = '(บันทึก local — ไม่ sync)';
-  document.getElementById('settings-modal').classList.remove('open');
-  showToast('เปลี่ยนเป็น Local mode แล้ว');
 }
 </script>
 </body>
